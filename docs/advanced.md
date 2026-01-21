@@ -46,6 +46,8 @@ Each message is a JSON snapshot containing only sessions that are considered **a
       "cwd": "/Users/me/project",
       "last_response": "Streaming output so far…",
       "updated_at": "2025-01-01T00:00:04Z",
+      "last_modified_ms": 1735689604000,
+      "status": "working",
       "rollout_path": "/Users/me/.codex/sessions/2025/01/01/rollout-2025-01-01T00-00-00Z-...jsonl"
     }
   ]
@@ -63,17 +65,19 @@ This fallback is important for sessions that are still running but have not yet 
 
 ### Working vs idle
 
-The payload does not include an explicit `status` field. To differentiate **working** vs **idle**, use recency:
+The payload includes a `status` field:
 
-- **Working**: the rollout file is updating frequently (e.g., `updated_at` is within your “working” window, such as the last 5–15 seconds).
-- **Idle/online**: the session is still active (within the active window) but `updated_at` is older.
+- `working` if the rollout was modified within the **working window**
+- `idle` if the session is active but no recent write happened
 
-If you need a hard status flag, you can treat a lack of updates as idle and a fresh update as working.
+You can override the working window with `--working-window-seconds` (default: 15).
 
 ### Fields
 
 - `last_response` is the newest assistant text (partial while streaming).
-- `updated_at` is the last recorded timestamp in the rollout file.
+- `updated_at` is the last recorded timestamp in the rollout file (from the JSONL line).
+- `last_modified_ms` is the file modification time in Unix milliseconds (useful for recency).
+- `status` is `working` or `idle` based on `last_modified_ms`.
 - `rollout_path` points to the JSONL file under `~/.codex/sessions/`.
 
 When no sessions are active, the `sessions` array is empty.
@@ -84,6 +88,12 @@ By default, the monitor treats sessions as active if their rollout file was upda
 
 ```bash
 codex monitor --host 127.0.0.1 --port 8787 --active-window-seconds 120
+```
+
+You can also adjust the working window:
+
+```bash
+codex monitor --host 127.0.0.1 --port 8787 --working-window-seconds 15
 ```
 
 ## Model Context Protocol (MCP) {#model-context-protocol}

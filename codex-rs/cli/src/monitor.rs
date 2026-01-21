@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -57,11 +58,22 @@ pub struct MonitorCommand {
     /// Treat sessions as active if updated within this window (seconds).
     #[arg(long = "active-window-seconds", default_value_t = 120)]
     pub active_window_seconds: i64,
+
+    /// Mark sessions as working if updated within this window (seconds).
+    #[arg(long = "working-window-seconds", default_value_t = 15)]
+    pub working_window_seconds: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct SessionSnapshot {
     sessions: Vec<ActiveSession>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionStatus {
+    Working,
+    Idle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -72,6 +84,8 @@ struct ActiveSession {
     cwd: Option<String>,
     last_response: Option<String>,
     updated_at: Option<String>,
+    last_modified_ms: Option<i64>,
+    status: SessionStatus,
     rollout_path: String,
 }
 
@@ -88,6 +102,7 @@ pub async fn run_monitor(
 ) -> Result<()> {
     let poll_interval = validate_poll_interval(cmd.poll_interval_ms)?;
     let active_window = validate_active_window(cmd.active_window_seconds)?;
+    let working_window = validate_working_window(cmd.working_window_seconds)?;
     let addr = build_socket_addr(&cmd.host, cmd.port)?;
     let (codex_home, default_provider) =
         resolve_monitor_config(root_config_overrides, config_profile).await?;
@@ -104,6 +119,7 @@ pub async fn run_monitor(
         default_provider,
         poll_interval,
         active_window,
+        working_window,
         latest,
         updates,
     ));
@@ -203,6 +219,7 @@ async fn monitor_loop(
     default_provider: String,
     poll_interval: Duration,
     active_window: StdDuration,
+    working_window: StdDuration,
     latest: Arc<RwLock<Option<SessionSnapshot>>>,
     updates: broadcast::Sender<SessionSnapshot>,
 ) {
@@ -211,7 +228,14 @@ async fn monitor_loop(
 
     loop {
         ticker.tick().await;
-        match build_snapshot(&codex_home, &default_provider, active_window).await {
+        match build_snapshot(
+            &codex_home,
+            &default_provider,
+            active_window,
+            working_window,
+        )
+        .await
+        {
             Ok(snapshot) => {
                 if last_snapshot.as_ref() != Some(&snapshot) {
                     *latest.write().await = Some(snapshot.clone());
@@ -230,6 +254,7 @@ async fn build_snapshot(
     codex_home: &Path,
     default_provider: &str,
     active_window: StdDuration,
+    working_window: StdDuration,
 ) -> Result<SessionSnapshot> {
     let mut sessions = Vec::new();
     let mut cursor = None;
@@ -247,7 +272,7 @@ async fn build_snapshot(
         .context("failed to list conversations")?;
 
         for item in page.items {
-            if let Some(status) = read_rollout_status(&item.path, active_window)
+            if let Some(status) = read_rollout_status(&item.path, active_window, working_window)
                 .await
                 .with_context(|| format!("failed to read rollout {}", item.path.display()))?
             {
@@ -261,13 +286,21 @@ async fn build_snapshot(
         }
     }
 
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions.sort_by(|a, b| {
+        let by_updated = b.updated_at.cmp(&a.updated_at);
+        if by_updated == std::cmp::Ordering::Equal {
+            b.last_modified_ms.cmp(&a.last_modified_ms)
+        } else {
+            by_updated
+        }
+    });
     Ok(SessionSnapshot { sessions })
 }
 
 async fn read_rollout_status(
     path: &Path,
     active_window: StdDuration,
+    working_window: StdDuration,
 ) -> Result<Option<ActiveSession>> {
     let modified = tokio::fs::metadata(path)
         .await
@@ -279,6 +312,7 @@ async fn read_rollout_status(
         contents.lines(),
         modified,
         active_window,
+        working_window,
     ))
 }
 
@@ -287,7 +321,13 @@ fn status_from_lines<'a>(
     path: &Path,
     lines: impl Iterator<Item = &'a str>,
 ) -> Option<ActiveSession> {
-    status_from_lines_with_window(path, lines, None, StdDuration::from_secs(0))
+    status_from_lines_with_window(
+        path,
+        lines,
+        None,
+        StdDuration::from_secs(0),
+        StdDuration::from_secs(0),
+    )
 }
 
 fn status_from_lines_with_window<'a>(
@@ -295,8 +335,9 @@ fn status_from_lines_with_window<'a>(
     lines: impl Iterator<Item = &'a str>,
     modified: Option<SystemTime>,
     active_window: StdDuration,
+    working_window: StdDuration,
 ) -> Option<ActiveSession> {
-    let mut tracker = RolloutStatusTracker::new(path, modified, active_window);
+    let mut tracker = RolloutStatusTracker::new(path, modified, active_window, working_window);
     for line in lines {
         let Ok(entry) = serde_json::from_str::<RolloutLine>(line) else {
             continue;
@@ -310,6 +351,7 @@ struct RolloutStatusTracker {
     path: PathBuf,
     modified: Option<SystemTime>,
     active_window: StdDuration,
+    working_window: StdDuration,
     session_id: Option<String>,
     thread_id: Option<String>,
     turn_id: Option<String>,
@@ -322,11 +364,17 @@ struct RolloutStatusTracker {
 }
 
 impl RolloutStatusTracker {
-    fn new(path: &Path, modified: Option<SystemTime>, active_window: StdDuration) -> Self {
+    fn new(
+        path: &Path,
+        modified: Option<SystemTime>,
+        active_window: StdDuration,
+        working_window: StdDuration,
+    ) -> Self {
         Self {
             path: path.to_path_buf(),
             modified,
             active_window,
+            working_window,
             session_id: None,
             thread_id: None,
             turn_id: None,
@@ -501,6 +549,21 @@ impl RolloutStatusTracker {
             .or_else(|| self.thread_id.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
+        let last_modified_ms = self
+            .modified
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok());
+        let status = self
+            .modified
+            .and_then(|modified| modified.elapsed().ok())
+            .map_or(SessionStatus::Idle, |elapsed| {
+                if elapsed <= self.working_window {
+                    SessionStatus::Working
+                } else {
+                    SessionStatus::Idle
+                }
+            });
+
         Some(ActiveSession {
             session_id,
             thread_id: self.thread_id,
@@ -508,6 +571,8 @@ impl RolloutStatusTracker {
             cwd: self.cwd,
             last_response: self.last_response,
             updated_at: self.updated_at,
+            last_modified_ms,
+            status,
             rollout_path: self.path.to_string_lossy().to_string(),
         })
     }
@@ -537,6 +602,14 @@ fn validate_active_window(active_window_seconds: i64) -> Result<StdDuration> {
         return Err(anyhow!("active window must be > 0"));
     }
     let secs = u64::try_from(active_window_seconds).context("active window too large")?;
+    Ok(StdDuration::from_secs(secs))
+}
+
+fn validate_working_window(working_window_seconds: i64) -> Result<StdDuration> {
+    if working_window_seconds <= 0 {
+        return Err(anyhow!("working window must be > 0"));
+    }
+    let secs = u64::try_from(working_window_seconds).context("working window too large")?;
     Ok(StdDuration::from_secs(secs))
 }
 
@@ -637,6 +710,8 @@ mod tests {
                 cwd: Some("/tmp".to_string()),
                 last_response: Some("Hello world".to_string()),
                 updated_at: Some("2025-01-01T00:00:04Z".to_string()),
+                last_modified_ms: None,
+                status: SessionStatus::Idle,
                 rollout_path: "/rollout.jsonl".to_string(),
             }
         );
@@ -703,11 +778,14 @@ mod tests {
             lines.iter().map(std::string::String::as_str),
             Some(SystemTime::now()),
             StdDuration::from_secs(120),
+            StdDuration::from_secs(15),
         )
         .expect("expected active session");
 
         assert_eq!(status.session_id, conversation_id.to_string());
         assert_eq!(status.cwd, Some("/tmp".to_string()));
+        assert_eq!(status.status, SessionStatus::Working);
+        assert!(status.last_modified_ms.is_some());
     }
 
     #[test]
@@ -746,6 +824,7 @@ mod tests {
             lines.iter().map(std::string::String::as_str),
             Some(old_time),
             StdDuration::from_secs(120),
+            StdDuration::from_secs(15),
         )
         .expect("expected active session");
 
@@ -791,6 +870,7 @@ mod tests {
             lines.iter().map(std::string::String::as_str),
             Some(SystemTime::now()),
             StdDuration::from_secs(120),
+            StdDuration::from_secs(15),
         );
 
         assert_eq!(status, None);
@@ -835,6 +915,7 @@ mod tests {
             lines.iter().map(std::string::String::as_str),
             Some(SystemTime::now()),
             StdDuration::from_secs(120),
+            StdDuration::from_secs(15),
         );
 
         assert_eq!(status, None);
@@ -868,8 +949,42 @@ mod tests {
             lines.iter().map(std::string::String::as_str),
             Some(old_time),
             StdDuration::from_secs(120),
+            StdDuration::from_secs(15),
         );
 
         assert_eq!(status, None);
+    }
+
+    #[test]
+    fn status_from_lines_recent_activity_marks_idle_when_stale() {
+        let conversation_id = ConversationId::new();
+        let meta = RolloutItem::SessionMeta(SessionMetaLine {
+            meta: codex_protocol::protocol::SessionMeta {
+                id: conversation_id,
+                timestamp: "2025-01-01T00:00:00Z".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                originator: "codex_cli_rs".to_string(),
+                cli_version: "0.0.0".to_string(),
+                instructions: None,
+                source: SessionSource::default(),
+                model_provider: None,
+            },
+            git: None,
+        });
+
+        let lines = [rollout_line("2025-01-01T00:00:00Z", meta)];
+        let stale_time = SystemTime::now()
+            .checked_sub(StdDuration::from_secs(60))
+            .expect("stale time");
+        let status = status_from_lines_with_window(
+            Path::new("/rollout.jsonl"),
+            lines.iter().map(std::string::String::as_str),
+            Some(stale_time),
+            StdDuration::from_secs(120),
+            StdDuration::from_secs(15),
+        )
+        .expect("expected active session");
+
+        assert_eq!(status.status, SessionStatus::Idle);
     }
 }
