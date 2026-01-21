@@ -20,6 +20,72 @@ By comparison, the non-interactive mode (`codex exec`) defaults to `RUST_LOG=err
 
 See the Rust documentation on [`RUST_LOG`](https://docs.rs/env_logger/latest/env_logger/#enabling-logging) for more information on the configuration options.
 
+## Live session monitor (WebSocket) {#monitor}
+
+Use the monitor server to watch for **active** Codex sessions and stream the latest assistant response as it is produced.
+
+```bash
+codex monitor --host 127.0.0.1 --port 8787
+```
+
+Connect with a WebSocket client (for example, [`websocat`](https://github.com/vi/websocat)):
+
+```bash
+websocat ws://127.0.0.1:8787/ws
+```
+
+Each message is a JSON snapshot containing only sessions that are considered **active**:
+
+```json
+{
+  "sessions": [
+    {
+      "session_id": "thr_123",
+      "thread_id": "thr_123",
+      "turn_id": "turn_456",
+      "cwd": "/Users/me/project",
+      "last_response": "Streaming output so far…",
+      "updated_at": "2025-01-01T00:00:04Z",
+      "rollout_path": "/Users/me/.codex/sessions/2025/01/01/rollout-2025-01-01T00-00-00Z-...jsonl"
+    }
+  ]
+}
+```
+
+### What “active” means
+
+The monitor marks a session as active if **either**:
+
+1) The rollout includes a live task lifecycle event (a `task_started` without a matching completion), **or**
+2) The rollout file was modified recently (within `--active-window-seconds`).
+
+This fallback is important for sessions that are still running but have not yet written a task lifecycle marker.
+
+### Working vs idle
+
+The payload does not include an explicit `status` field. To differentiate **working** vs **idle**, use recency:
+
+- **Working**: the rollout file is updating frequently (e.g., `updated_at` is within your “working” window, such as the last 5–15 seconds).
+- **Idle/online**: the session is still active (within the active window) but `updated_at` is older.
+
+If you need a hard status flag, you can treat a lack of updates as idle and a fresh update as working.
+
+### Fields
+
+- `last_response` is the newest assistant text (partial while streaming).
+- `updated_at` is the last recorded timestamp in the rollout file.
+- `rollout_path` points to the JSONL file under `~/.codex/sessions/`.
+
+When no sessions are active, the `sessions` array is empty.
+
+### Configure the active window
+
+By default, the monitor treats sessions as active if their rollout file was updated within the last **120 seconds**. You can adjust the window:
+
+```bash
+codex monitor --host 127.0.0.1 --port 8787 --active-window-seconds 120
+```
+
 ## Model Context Protocol (MCP) {#model-context-protocol}
 
 The Codex CLI and IDE extension is a MCP client which means that it can be configured to connect to MCP servers. For more information, refer to the [`config docs`](./config.md#mcp-integration).

@@ -47,8 +47,6 @@ pub(crate) fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::TurnAborted(_) => true,
         EventMsg::Error(_)
         | EventMsg::Warning(_)
-        | EventMsg::TaskStarted(_)
-        | EventMsg::TaskComplete(_)
         | EventMsg::AgentMessageDelta(_)
         | EventMsg::AgentReasoningDelta(_)
         | EventMsg::AgentReasoningRawContentDelta(_)
@@ -82,5 +80,27 @@ pub(crate) fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::AgentMessageContentDelta(_)
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_) => false,
+        EventMsg::TaskStarted(_) | EventMsg::TaskComplete(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::TaskCompleteEvent;
+    use crate::protocol::TaskStartedEvent;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn task_lifecycle_events_are_persisted() {
+        let started = EventMsg::TaskStarted(TaskStartedEvent {
+            model_context_window: None,
+        });
+        let completed = EventMsg::TaskComplete(TaskCompleteEvent {
+            last_agent_message: None,
+        });
+
+        assert_eq!(should_persist_event_msg(&started), true);
+        assert_eq!(should_persist_event_msg(&completed), true);
     }
 }
